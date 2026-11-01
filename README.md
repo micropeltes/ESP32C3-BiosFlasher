@@ -61,8 +61,8 @@ mode download, atau cabut-colok USB.
 | `unprotect` | clear block-protect (BP = 000) |
 | `wsr <sr1> [sr2]` | tulis status register manual |
 | `freq <khz>` | ubah clock SPI (100–40000 kHz, default 8000) |
-| `fastread on|off` | pakai perintah 0x0B (perlu untuk clock tinggi) |
-| `addr4 on|off` | mode alamat 4 byte (otomatis untuk chip > 16 MB) |
+| `fastread on\|off` | pakai perintah 0x0B (perlu untuk clock tinggi) |
+| `addr4 on\|off` | mode alamat 4 byte (otomatis untuk chip > 16 MB) |
 | `reset` | soft reset chip flash |
 | `pins` | tampilkan pin yang dipakai |
 
