@@ -27,6 +27,7 @@ import argparse
 import os
 import sys
 import time
+import zlib
 
 try:
     import serial
@@ -128,10 +129,9 @@ class Flasher(object):
                 cur = bytearray()
                 continue
             cur += b
-            if cur.endswith(b"> "):
-                text = cur[:-2].decode("ascii", "replace").strip()
-                if text:
-                    lines.append(text)
+            # prompt "> " selalu berdiri sendiri di awal baris
+            # (jangan pakai endswith: baris seperti "-> SR1=0x00" juga memuat "> ")
+            if cur == b"> ":
                 return lines
         raise DeviceError("timeout menunggu prompt (device tidak merespon?)")
 
@@ -225,6 +225,52 @@ class Flasher(object):
         self.sync(5.0)
         return data
 
+    def read_crc(self, addr, length):
+        """CRC32 isi flash (zlib) atau None kalau firmware belum mendukung."""
+        self._write("crc %d %d\n" % (addr, length))
+        while True:
+            ln = self.read_line(120.0)
+            if ln is None:
+                raise DeviceError("timeout menunggu hasil crc")
+            ln = ln.strip()
+            if not ln:
+                continue
+            if ln.startswith("!ERR"):
+                if "tidak dikenal" in ln:
+                    self.sync(2.0)
+                    return None
+                raise DeviceError(ln)
+            if ln.startswith("CRC32"):
+                self.sync(3.0)
+                parts = ln.split()
+                return int(parts[3], 16)
+            if ln.startswith("OK"):
+                continue
+
+    def blank_check(self, addr, length):
+        """(didukung, bad_first, bad_count) - cek apakah area semua 0xFF."""
+        self._write("blank %d %d\n" % (addr, length))
+        while True:
+            ln = self.read_line(120.0)
+            if ln is None:
+                raise DeviceError("timeout menunggu hasil blank")
+            ln = ln.strip()
+            if not ln:
+                continue
+            if ln.startswith("!ERR"):
+                if "tidak dikenal" in ln:
+                    self.sync(2.0)
+                    return (False, 0, 0)
+                raise DeviceError(ln)
+            if ln.startswith("BLANK OK"):
+                self.sync(3.0)
+                return (True, 0, 0)
+            if ln.startswith("BLANK FAIL"):
+                self.sync(3.0)
+                parts = ln.split()
+                return (True, int(parts[2], 16), int(parts[3]))
+
+
 # --------------------------------------------------------------------------
 #  CLI
 # --------------------------------------------------------------------------
@@ -278,7 +324,39 @@ def do_write(fl, args):
 def do_verify(fl, args):
     addr = parse_int(args.addr)
     data = load_image(args.file)
+
+    chip_crc = fl.read_crc(addr, len(data))
+    if chip_crc is not None:
+        file_crc = zlib.crc32(data) & 0xFFFFFFFF
+        if chip_crc != file_crc:
+            raise DeviceError("CRC32 tidak cocok: file %08X, chip %08X" % (file_crc, chip_crc))
+        print("CRC32 cocok (%08X)" % file_crc)
+        return
+
+    print("firmware lama - verifikasi byte-per-byte")
     print(fl.verify_flash(addr, data))
+
+
+def do_crc(fl, args):
+    addr = parse_int(args.addr)
+    length = parse_int(args.length)
+    value = fl.read_crc(addr, length)
+    if value is None:
+        sys.exit("firmware belum mendukung perintah 'crc'")
+    print("CRC32 %08X (%d byte dari 0x%08X)" % (value, length, addr))
+
+
+def do_blank(fl, args):
+    addr = parse_int(args.addr)
+    length = parse_int(args.length)
+    supported, first, count = fl.blank_check(addr, length)
+    if not supported:
+        sys.exit("firmware belum mendukung perintah 'blank'")
+    if count == 0:
+        print("OK - %d byte kosong (0xFF)" % length)
+    else:
+        print("TIDAK kosong: %d byte bukan 0xFF, pertama di offset 0x%X" % (count, first))
+
 
 
 def do_erase(fl, args, block=False):
@@ -350,6 +428,14 @@ def build_parser():
     p.add_argument("addr")
     p.add_argument("length")
 
+    p = sub.add_parser("crc", help="CRC32 isi flash (zlib) pada range")
+    p.add_argument("addr")
+    p.add_argument("length")
+
+    p = sub.add_parser("blank", help="cek apakah range kosong (0xFF)")
+    p.add_argument("addr")
+    p.add_argument("length")
+
     p = sub.add_parser("berase", help="hapus block 64 KB yang tercakup range")
     p.add_argument("addr")
     p.add_argument("length")
@@ -397,6 +483,10 @@ def main(argv=None):
             do_verify(fl, args)
         elif args.action == "erase":
             do_erase(fl, args, block=False)
+        elif args.action == "crc":
+            do_crc(fl, args)
+        elif args.action == "blank":
+            do_blank(fl, args)
         elif args.action == "berase":
             do_erase(fl, args, block=True)
         elif args.action == "chiperase":

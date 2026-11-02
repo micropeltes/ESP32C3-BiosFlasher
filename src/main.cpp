@@ -586,6 +586,9 @@ static void printHelp() {
       " status | st               status register 1/2/3\r\n"
       " read <addr> [len]         hexdump isi flash\r\n"
       " binread <addr> <len>      dump biner (header @BIN, akhir @END)\r\n"
+      " crc <addr> [len]          CRC32 isi flash (zlib/PNG)\r\n"
+      " blank <addr> [len]        cek kosong (semua 0xFF)\r\n"
+      " wbin <addr> <len>         tulis biner mentah (cepat)\r\n"
       " write <addr>              tulis data (kirim baris hex, '.' = selesai)\r\n"
       " verify <addr>             verifikasi (kirim baris hex, '.' = selesai)\r\n"
       " erase <addr> [n]          hapus n sector (4 KB, default 1)\r\n"
@@ -672,6 +675,168 @@ static void cmdBinRead(uint32_t addr, uint32_t len) {
     remaining -= n;
   }
   Serial.printf("\n@END %lu ms\n", (unsigned long)(millis() - t0));
+}
+
+/* ---------------------- CRC32 (zlib/PNG compatible) ----------------------- */
+static uint32_t g_crcTable[256];
+static bool g_crcTableReady = false;
+
+static void crc32InitTable() {
+  if (g_crcTableReady) {
+    return;
+  }
+  for (uint32_t i = 0; i < 256; i++) {
+    uint32_t c = i;
+    for (int k = 0; k < 8; k++) {
+      c = (c & 1) ? (0xEDB88320UL ^ (c >> 1)) : (c >> 1);
+    }
+    g_crcTable[i] = c;
+  }
+  g_crcTableReady = true;
+}
+
+static uint32_t crc32Update(uint32_t crc, const uint8_t *data, uint32_t len) {
+  for (uint32_t i = 0; i < len; i++) {
+    crc = g_crcTable[(crc ^ data[i]) & 0xFF] ^ (crc >> 8);
+  }
+  return crc;
+}
+
+/* crc <addr> [len]  ->  "CRC32 00000000 1048576 1A2B3C4D" */
+static void cmdCrc(uint32_t addr, uint32_t len) {
+  static uint8_t buf[512];
+  if (!len) {
+    len = chipLimit();
+  }
+  if (!checkRange(addr, len)) {
+    return;
+  }
+  crc32InitTable();
+  uint32_t t0 = millis();
+  uint32_t crc = 0xFFFFFFFFUL;
+  uint32_t remaining = len;
+  while (remaining) {
+    uint32_t n = remaining > sizeof(buf) ? (uint32_t)sizeof(buf) : remaining;
+    readData(addr, buf, n);
+    crc = crc32Update(crc, buf, n);
+    addr += n;
+    remaining -= n;
+  }
+  crc ^= 0xFFFFFFFFUL;
+  Serial.printf("CRC32 %08lX %lu %08lX %lu ms\n", (unsigned long)addr - len,
+                (unsigned long)len, (unsigned long)crc,
+                (unsigned long)(millis() - t0));
+}
+
+/* blank <addr> [len]  ->  "BLANK OK" atau "BLANK FAIL <offset> <count>" */
+static void cmdBlank(uint32_t addr, uint32_t len) {
+  static uint8_t buf[512];
+  if (!len) {
+    len = chipLimit();
+  }
+  if (!checkRange(addr, len)) {
+    return;
+  }
+  uint32_t start = addr;
+  uint32_t badFirst = 0;
+  uint32_t badCount = 0;
+  uint32_t remaining = len;
+  while (remaining) {
+    uint32_t n = remaining > sizeof(buf) ? (uint32_t)sizeof(buf) : remaining;
+    readData(addr, buf, n);
+    for (uint32_t i = 0; i < n; i++) {
+      if (buf[i] != 0xFF) {
+        if (!badCount) {
+          badFirst = addr + i - start;
+        }
+        badCount++;
+      }
+    }
+    addr += n;
+    remaining -= n;
+  }
+  if (badCount == 0) {
+    Serial.printf("BLANK OK %lu\n", (unsigned long)len);
+  } else {
+    Serial.printf("BLANK FAIL %08lX %lu\n", (unsigned long)badFirst,
+                  (unsigned long)badCount);
+  }
+}
+
+/* ------------------- tulis biner (tanpa encoding hex) -------------------- */
+static const uint32_t WBIN_CHUNK = 1024;
+
+/* baca tepat n byte mentah dari USB CDC; false kalau timeout */
+static bool readRawBytes(uint8_t *buf, uint32_t n, uint32_t timeoutMs) {
+  uint32_t got = 0;
+  uint32_t t0 = millis();
+  while (got < n) {
+    int c = serialReadByte();
+    if (c < 0) {
+      if (millis() - t0 >= timeoutMs) {
+        return false;
+      }
+      delay(1);
+      continue;
+    }
+    buf[got++] = (uint8_t)c;
+    t0 = millis();
+  }
+  return true;
+}
+
+/* wbin <addr> <len> : firmware jawab "WBIN READY addr len chunk",
+ * lalu host mengirim chunk byte mentah, tiap chunk dijawab '+'           */
+static void cmdWriteBinary(uint32_t addr, uint32_t total) {
+  static uint8_t chunk[WBIN_CHUNK];
+  static uint8_t pageBuf[PAGE_SIZE];
+  uint16_t pageLen = 0;
+  uint32_t done = 0;
+
+  if (!total) {
+    Serial.print("!ERR butuh <len>\r\n");
+    return;
+  }
+  if (!checkRange(addr, total)) {
+    return;
+  }
+  Serial.printf("WBIN READY %08lX %lu %lu\n", (unsigned long)addr,
+                (unsigned long)total, (unsigned long)WBIN_CHUNK);
+
+  uint32_t t0 = millis();
+  while (done < total) {
+    uint32_t n = total - done;
+    if (n > WBIN_CHUNK) {
+      n = WBIN_CHUNK;
+    }
+    if (!readRawBytes(chunk, n, 20000)) {
+      Serial.print("\n!ERR timeout data biner\n");
+      return;
+    }
+    for (uint32_t i = 0; i < n; i++) {
+      uint32_t cur = addr + done + i;
+      uint32_t pageStart = cur - pageLen;
+      uint16_t limit = (uint16_t)(PAGE_SIZE - (pageStart % PAGE_SIZE));
+      pageBuf[pageLen++] = chunk[i];
+      if (pageLen >= limit) {
+        if (!programPage(pageStart, pageBuf, pageLen)) {
+          Serial.print("\n!ERR gagal program halaman (write-protect?)\n");
+          return;
+        }
+        pageLen = 0;
+      }
+    }
+    done += n;
+    Serial.write('+');
+  }
+  if (pageLen) {
+    if (!programPage(addr + done - pageLen, pageBuf, pageLen)) {
+      Serial.print("\n!ERR gagal program halaman terakhir\n");
+      return;
+    }
+  }
+  Serial.printf("\nWBIN DONE %lu %lu ms\n", (unsigned long)done,
+                (unsigned long)(millis() - t0));
 }
 
 static void cmdErase(uint32_t addr, uint32_t count, bool block) {
@@ -1005,6 +1170,36 @@ static void handleCommand(char *line) {
       return;
     }
     cmdBinRead(v1, v2);
+  } else if (!strcasecmp(cmd, "crc")) {
+    v1 = 0;
+    v2 = 0;
+    if (a1 && !parseU32(a1, &v1)) {
+      Serial.print("!ERR <addr> tidak valid\r\n");
+      return;
+    }
+    if (a2 && !parseU32(a2, &v2)) {
+      Serial.print("!ERR <len> tidak valid\r\n");
+      return;
+    }
+    cmdCrc(v1, v2);
+  } else if (!strcasecmp(cmd, "blank") || !strcasecmp(cmd, "blankcheck")) {
+    v1 = 0;
+    v2 = 0;
+    if (a1 && !parseU32(a1, &v1)) {
+      Serial.print("!ERR <addr> tidak valid\r\n");
+      return;
+    }
+    if (a2 && !parseU32(a2, &v2)) {
+      Serial.print("!ERR <len> tidak valid\r\n");
+      return;
+    }
+    cmdBlank(v1, v2);
+  } else if (!strcasecmp(cmd, "wbin") || !strcasecmp(cmd, "wb")) {
+    if (!parseU32(a1, &v1) || !parseU32(a2, &v2)) {
+      Serial.print("!ERR butuh <addr> <len>\r\n");
+      return;
+    }
+    cmdWriteBinary(v1, v2);
   } else if (!strcasecmp(cmd, "write")) {
     v1 = 0;
     if (a1 && !parseU32(a1, &v1)) {

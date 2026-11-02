@@ -53,6 +53,9 @@ mode download, atau cabut-colok USB.
 | `status` | baca SR1/SR2/SR3 |
 | `read <addr> [len]` | hexdump isi flash |
 | `binread <addr> <len>` | dump biner (header `@BIN`, akhir `@END`) |
+| `crc <addr> [len]` | CRC32 isi flash (zlib/PNG) — verifikasi cepat |
+| `blank <addr> [len]` | cek area kosong (semua 0xFF) |
+| `wbin <addr> <len>` | tulis biner mentah (1024 byte/chunk, ~2x lebih cepat dari hex) |
 | `write <addr>` | mulai tulis: kirim baris hex, `.` = selesai |
 | `verify <addr>` | verifikasi dengan baris hex, `.` = selesai |
 | `erase <addr> [n]` | hapus n sector 4 KB |
@@ -86,7 +89,15 @@ python tools/biosflash.py console                   # mode interaktif
 - `-p COM5` untuk memilih port (default: auto-detect VID `0x303A`).
 - Alamat/panjang boleh desimal atau `0x...`.
 - `write` default mulai di alamat 0 dan otomatis meng-erase sector yang
-  tercakup, lalu memverifikasi.
+  tercakup, lalu memverifikasi (CRC32 kalau firmware mendukung, kalau tidak
+  fallback byte-per-byte).
+
+Perintah tambahan yang cepat:
+
+```bash
+python tools/biosflash.py crc 0 0x400000      # CRC32 isi flash
+python tools/biosflash.py blank 0 0x100000    # cek kosong (0xFF)
+```
 
 ## 5. Troubleshooting
 
